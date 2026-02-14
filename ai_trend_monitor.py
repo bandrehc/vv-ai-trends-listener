@@ -1,483 +1,520 @@
 """
-AI & N8N Trend Monitor — Multi-Country OSINT News Intelligence System
-=====================================================================
-Monitors Google Trends RSS feeds across 9 target countries, filters for
-AI/N8N-related trending topics, extracts associated news items, translates
-headlines to English, and outputs structured machine-readable JSON + Markdown.
+AI & N8N Daily Newsletter Generator — MVP
+==========================================
+Single script that:
+  1. Fetches AI/N8N news from 9 countries (Google News RSS + Tech feeds)
+  2. Deduplicates and clusters by topic
+  3. Generates a ~4000-word English newsletter in Markdown
+  4. Outputs JSON for downstream processing
 
-Adapted from: rss_checker.py (Peru Google Trends RSS monitor)
+Run daily via GitHub Actions. No API keys needed.
+
+Dependencies: pip install requests feedparser
 """
 
-import xml.etree.ElementTree as ET
+import feedparser
 import requests
 import hashlib
 import json
 import os
 import re
-import unicodedata
+import time
+import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import Optional
+from html import unescape
+from urllib.parse import quote, unquote
 
-# ─────────────────────────────────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═════════════════════════════════════════════════════════════════════
 
-# Target countries: geo code → metadata
+MAX_NEWSLETTER_WORDS = 4000
+
 COUNTRIES = {
-    "US": {"name": "United States",       "lang": "en", "tz": "America/New_York"},
-    "GB": {"name": "United Kingdom",      "lang": "en", "tz": "Europe/London"},
-    "PT": {"name": "Portugal",            "lang": "pt", "tz": "Europe/Lisbon"},
-    "DE": {"name": "Germany",             "lang": "de", "tz": "Europe/Berlin"},
-    "CN": {"name": "China",               "lang": "zh", "tz": "Asia/Shanghai"},
-    "JP": {"name": "Japan",               "lang": "ja", "tz": "Asia/Tokyo"},
-    "IL": {"name": "Israel",              "lang": "he", "tz": "Asia/Jerusalem"},
-    "AE": {"name": "United Arab Emirates", "lang": "ar", "tz": "Asia/Dubai"},
-    "CA": {"name": "Canada",              "lang": "en", "tz": "America/Toronto"},
+    "US": {"name": "United States",        "lang": "en", "hl": "en-US", "gl": "US", "ceid": "US:en"},
+    "GB": {"name": "United Kingdom",       "lang": "en", "hl": "en-GB", "gl": "GB", "ceid": "GB:en"},
+    "CA": {"name": "Canada",               "lang": "en", "hl": "en-CA", "gl": "CA", "ceid": "CA:en"},
+    "DE": {"name": "Germany",              "lang": "de", "hl": "de",    "gl": "DE", "ceid": "DE:de"},
+    "PT": {"name": "Portugal",             "lang": "pt", "hl": "pt-PT", "gl": "PT", "ceid": "PT:pt-150"},
+    "JP": {"name": "Japan",                "lang": "ja", "hl": "ja",    "gl": "JP", "ceid": "JP:ja"},
+    "CN": {"name": "China",                "lang": "zh", "hl": "zh-CN", "gl": "CN", "ceid": "CN:zh-Hans"},
+    "IL": {"name": "Israel",               "lang": "he", "hl": "he",    "gl": "IL", "ceid": "IL:he"},
+    "AE": {"name": "United Arab Emirates",  "lang": "ar", "hl": "ar",    "gl": "AE", "ceid": "AE:ar"},
 }
 
-RSS_URL_TEMPLATE = "https://trends.google.com/trending/rss?geo={geo}"
+SEARCH_QUERIES = {
+    "en": [
+        "artificial intelligence",
+        "ChatGPT OpenAI",
+        "generative AI",
+        "n8n automation",
+        "LLM large language model",
+        "AI regulation",
+        "AI startup funding",
+        "AI agents",
+        "Anthropic Claude",
+        "AI chip GPU",
+        "deep learning",
+        "machine learning",
+    ],
+    "de": ["künstliche Intelligenz", "generative KI", "ChatGPT", "KI Regulierung", "maschinelles Lernen"],
+    "pt": ["inteligência artificial", "IA generativa", "ChatGPT", "automação n8n", "aprendizado de máquina"],
+    "ja": ["人工知能", "生成AI", "ChatGPT", "大規模言語モデル", "機械学習"],
+    "zh": ["人工智能", "生成式AI", "ChatGPT", "大语言模型", "机器学习", "深度学习"],
+    "he": ["בינה מלאכותית", "ChatGPT", "artificial intelligence Israel"],
+    "ar": ["الذكاء الاصطناعي", "ChatGPT", "artificial intelligence UAE"],
+}
 
-# XML namespace for Google Trends RSS
-NS = {"ht": "https://trends.google.com/trending/rss"}
+TECH_FEEDS = {
+    "TechCrunch AI":   "https://techcrunch.com/category/artificial-intelligence/feed/",
+    "The Verge AI":    "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+    "Wired AI":        "https://www.wired.com/feed/tag/ai/latest/rss",
+    "VentureBeat AI":  "https://venturebeat.com/category/ai/feed/",
+    "Ars Technica":    "https://feeds.arstechnica.com/arstechnica/index",
+    "MIT Tech Review": "https://www.technologyreview.com/feed/",
+    "AI News":         "https://www.artificialintelligence-news.com/feed/",
+    "HN AI":           "https://hnrss.org/newest?q=AI+OR+LLM+OR+n8n&count=20",
+}
 
-# ─────────────────────────────────────────────────────────────────────
-#  SEMANTIC KEYWORD ENGINE
-# ─────────────────────────────────────────────────────────────────────
-# Multi-tier keyword matching for precision filtering.
-# Tier 1: Exact-match high-confidence keywords (case-insensitive)
-# Tier 2: Pattern-based matching (regex) for compound terms
-# Tier 3: Contextual disambiguation — reject false positives
-
-# Tier 1 — Primary keywords (exact token match, case-insensitive)
-PRIMARY_KEYWORDS = {
-    # Core scope
+# AI relevance filter (for general feeds like Ars Technica)
+AI_KEYWORDS = {
     "n8n", "artificial intelligence", "machine learning", "deep learning",
-    "generative ai", "gen ai", "genai",
-    # Model types
-    "llm", "large language model", "language model", "foundation model",
-    "transformer model", "diffusion model", "multimodal model",
-    # Specific technologies & products
-    "chatgpt", "openai", "claude", "anthropic", "gemini ai", "google ai",
-    "copilot ai", "github copilot", "midjourney", "stable diffusion",
-    "dall-e", "dalle", "sora ai", "mistral ai", "mistral", "llama model",
-    "grok ai", "perplexity ai", "hugging face", "huggingface",
-    "deepseek", "cohere ai",
-    # Automation & agents
-    "ai agent", "ai agents", "autonomous agent", "agentic ai",
-    "automation workflow", "workflow automation", "intelligent automation",
-    "robotic process automation", "rpa", "ai orchestration",
-    "make.com", "zapier ai", "langchain", "langgraph", "autogen",
-    "crewai", "crew ai",
-    # ML/DL core concepts
-    "neural network", "neural networks", "convolutional neural",
-    "recurrent neural", "reinforcement learning", "supervised learning",
-    "unsupervised learning", "transfer learning", "federated learning",
-    "computer vision", "natural language processing", "nlp",
-    "speech recognition", "text to speech", "text-to-speech",
-    "image generation", "image recognition", "object detection",
-    # AI safety & governance
-    "ai regulation", "ai safety", "ai ethics", "ai governance",
-    "ai alignment", "ai risk", "ai policy", "ai act", "ai bill",
-    "responsible ai", "explainable ai", "xai",
-    # Industry applications
-    "ai in healthcare", "ai in finance", "ai in education",
-    "ai in manufacturing", "ai chip", "ai chips", "ai hardware",
-    "ai accelerator", "gpu cluster", "ai datacenter", "ai data center",
-    "ai startup", "ai startups", "ai investment", "ai funding",
+    "generative ai", "genai", "llm", "large language model", "chatgpt",
+    "openai", "anthropic", "gemini", "copilot", "midjourney", "stable diffusion",
+    "dall-e", "dalle", "mistral", "deepseek", "hugging face", "huggingface",
+    "ai agent", "ai agents", "agentic ai", "langchain", "crewai", "autogen",
+    "neural network", "computer vision", "nlp", "natural language processing",
+    "ai regulation", "ai safety", "ai ethics", "ai chip", "ai startup",
+    "ai funding", "grok", "perplexity", "foundation model", "transformer",
+    "reinforcement learning", "workflow automation", "ai governance",
+    "inteligência artificial", "künstliche intelligenz", "人工智能", "人工知能",
+    "בינה מלאכותית", "الذكاء الاصطناعي",
 }
 
-# Tier 2 — Regex patterns for compound/contextual matching
-COMPOUND_PATTERNS = [
-    # "AI" as a standalone word with AI-relevant context
-    r"\bai\s+(?:model|system|tool|platform|assistant|chatbot|startup|company|research|lab|chip|regulation|safety|ethics|agent|powered|generated|driven|based|enabled|native)\b",
-    r"\b(?:generative|conversational|predictive|autonomous|agentic|responsible|explainable)\s+ai\b",
-    r"\bai[-\s](?:powered|generated|driven|based|enabled|native|first|ready)\b",
-    # Specific patterns
-    r"\bgpt[-\s]?\d",                         # GPT-4, GPT-5, etc.
-    r"\bclaude\s+\d",                          # Claude 3, Claude 4, etc.
-    r"\bgemini\s+(?:pro|ultra|nano|flash)\b",  # Gemini variants
-    r"\bllama\s*\d",                           # LLaMA 2, LLaMA 3
-    r"\bmistral\s+\d",                         # Mistral 7B etc.
-    r"\b(?:text|image|video|music|code)\s+generation\b",
-    r"\bprompt\s+(?:engineering|injection|tuning)\b",
-    r"\b(?:fine[- ]?tun(?:e|ing)|rag|retrieval.augmented)\b",
-    r"\b(?:artificial|machine|deep)\s+(?:intelligence|learning)\b",
-    r"\bneural\s+(?:net(?:work)?|architecture|engine)\b",
-    r"\brobot(?:ic)?s?\s+(?:ai|automation|process)\b",
-    r"\bn8n\b",
-    r"\bno[- ]?code\s+(?:ai|automation|workflow)\b",
-    r"\blow[- ]?code\s+(?:ai|automation|workflow)\b",
+AI_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"\bai\s+(?:model|system|tool|platform|startup|company|research|chip|regulation|safety|agent|powered|driven|based|enabled)\b",
+        r"\b(?:generative|autonomous|agentic|responsible|explainable)\s+ai\b",
+        r"\bai[-\s](?:powered|generated|driven|based|enabled)\b",
+        r"\bgpt[-\s]?\d", r"\bclaude\s+\d", r"\bgemini\s+(?:pro|ultra|flash)\b",
+        r"\bllama\s*\d", r"\bmistral\s+\d",
+        r"\b(?:artificial|machine|deep)\s+(?:intelligence|learning)\b",
+        r"\bneural\s+net(?:work)?", r"\bn8n\b",
+        r"\b(?:openai|anthropic|deepseek|google)\s+(?:launches?|releases?|announces?)\b",
+    ]
 ]
 
-# Compile all patterns for performance
-COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in COMPOUND_PATTERNS]
 
-# Tier 3 — False positive exclusion rules
-# If a trend title matches ONLY the bare token "AI" and contains any of these
-# contextual signals, it's likely a false positive (e.g., sports team "AI",
-# person name, place, etc.)
-FALSE_POSITIVE_SIGNALS = {
-    "allen iverson", "al ain", "ai weiwei", "ai miyazato",
-    "ai thinker", "ai uehara", "love ai", "ai takahashi",
-    "ai shinozaki", "ai otsuka", "ai kago",
-}
-
-# ─────────────────────────────────────────────────────────────────────
-#  FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────
-
-def normalize_text(text: str) -> str:
-    """Normalize unicode, strip accents for matching, lowercase."""
-    nfkd = unicodedata.normalize("NFKD", text)
-    ascii_text = nfkd.encode("ascii", "ignore").decode("ascii")
-    return ascii_text.lower().strip()
+def is_ai_related(text):
+    t = text.lower()
+    for kw in AI_KEYWORDS:
+        if re.search(r"\b" + re.escape(kw) + r"\b", t):
+            return True
+    for p in AI_PATTERNS:
+        if p.search(t):
+            return True
+    return False
 
 
-def is_ai_related(title: str, news_titles: list[str] = None) -> dict:
-    """
-    Multi-tier semantic filter. Returns a dict with:
-      - match: bool
-      - confidence: 'high' | 'medium' | 'low'
-      - matched_by: str (which keyword/pattern triggered)
-      - tier: int
-    """
-    title_lower = title.lower().strip()
-    title_normalized = normalize_text(title)
+# ═════════════════════════════════════════════════════════════════════
+#  DATA COLLECTION
+# ═════════════════════════════════════════════════════════════════════
 
-    # Check false positives first
-    for fp in FALSE_POSITIVE_SIGNALS:
-        if fp in title_lower:
-            return {"match": False, "confidence": None, "matched_by": f"fp_exclusion:{fp}", "tier": 0}
-
-    # Tier 1: Primary keyword exact match
-    for kw in PRIMARY_KEYWORDS:
-        kw_lower = kw.lower()
-        # Word boundary check
-        pattern = r"\b" + re.escape(kw_lower) + r"\b"
-        if re.search(pattern, title_lower):
-            return {"match": True, "confidence": "high", "matched_by": kw, "tier": 1}
-
-    # Tier 2: Compound regex patterns
-    for i, compiled in enumerate(COMPILED_PATTERNS):
-        if compiled.search(title_lower):
-            return {"match": True, "confidence": "high", "matched_by": f"pattern:{COMPOUND_PATTERNS[i]}", "tier": 2}
-
-    # Tier 2b: Check associated news headlines for contextual reinforcement
-    if news_titles:
-        combined = " ".join(news_titles).lower()
-        ai_signal_count = 0
-        for kw in PRIMARY_KEYWORDS:
-            if re.search(r"\b" + re.escape(kw.lower()) + r"\b", combined):
-                ai_signal_count += 1
-        for compiled in COMPILED_PATTERNS:
-            if compiled.search(combined):
-                ai_signal_count += 1
-        if ai_signal_count >= 2:
-            return {"match": True, "confidence": "medium", "matched_by": f"contextual_news_signals:{ai_signal_count}", "tier": 3}
-
-    # Tier 3: Bare "AI" token check with contextual disambiguation
-    if re.search(r"\bai\b", title_lower):
-        # Only accept if news titles also contain strong AI signals
-        if news_titles:
-            combined = " ".join(news_titles).lower()
-            strong_signals = [
-                "artificial intelligence", "machine learning", "deep learning",
-                "chatbot", "llm", "neural", "algorithm", "automation",
-                "openai", "chatgpt", "generative", "model", "training",
-                "dataset", "gpu", "chip", "regulation", "safety",
-            ]
-            signal_hits = sum(1 for s in strong_signals if s in combined)
-            if signal_hits >= 2:
-                return {"match": True, "confidence": "medium", "matched_by": "bare_ai_contextual", "tier": 3}
-        return {"match": False, "confidence": None, "matched_by": "bare_ai_no_context", "tier": 0}
-
-    return {"match": False, "confidence": None, "matched_by": None, "tier": 0}
-
-
-def fetch_rss(geo: str) -> Optional[bytes]:
-    """Fetch RSS content for a given country geo code."""
-    url = RSS_URL_TEMPLATE.format(geo=geo)
+def fetch_feed(url, label=""):
     try:
-        resp = requests.get(url, timeout=30, headers={
-            "User-Agent": "AI-Trend-Monitor/1.0 (OSINT Research)"
-        })
-        resp.raise_for_status()
-        return resp.content
-    except requests.RequestException as e:
-        print(f"  [WARN] Failed to fetch RSS for {geo}: {e}")
-        return None
+        feed = feedparser.parse(url, request_headers={"User-Agent": "AI-Newsletter/1.0"})
+        items = []
+        for e in feed.entries:
+            title = unescape(e.get("title", "")).strip()
+            link = e.get("link", "")
+            pub = e.get("published", e.get("updated", ""))
+            src = ""
+            if hasattr(e, "source"):
+                src = e.source.get("title", "") if isinstance(e.source, dict) else getattr(e.source, "title", "")
+            if title and link:
+                items.append({"title": title, "url": link, "published": pub, "source": src or label})
+        return items
+    except Exception as e:
+        print(f"  ⚠️  {label}: {e}")
+        return []
 
 
-def parse_rss(xml_content: bytes, geo: str) -> list[dict]:
-    """Parse Google Trends RSS into structured items."""
-    root = ET.fromstring(xml_content)
+def collect_google_news(geo, meta):
+    lang = meta["lang"]
+    queries = SEARCH_QUERIES.get(lang, [])
+    if lang != "en":
+        queries = queries + SEARCH_QUERIES["en"][:4]
+    queries = list(dict.fromkeys(queries))
+
     items = []
-
-    for item_el in root.findall("./channel/item"):
-        title = item_el.find("title").text or ""
-        traffic_el = item_el.find("ht:approx_traffic", NS)
-        approx_traffic = traffic_el.text if traffic_el is not None else "N/A"
-        pub_date = item_el.find("pubDate").text or ""
-
-        # Extract associated news items
-        news_items = []
-        for news_el in item_el.findall("ht:news_item", NS):
-            news_title_el = news_el.find("ht:news_item_title", NS)
-            news_url_el = news_el.find("ht:news_item_url", NS)
-            news_source_el = news_el.find("ht:news_item_source", NS)
-            news_picture_el = news_el.find("ht:news_item_picture", NS)
-
-            news_items.append({
-                "title": news_title_el.text if news_title_el is not None else "",
-                "url": news_url_el.text if news_url_el is not None else "",
-                "source": news_source_el.text if news_source_el is not None else "",
-                "picture": news_picture_el.text if news_picture_el is not None else "",
-            })
-
-        item_hash = hashlib.sha256(
-            (geo + title + pub_date).encode("utf-8")
-        ).hexdigest()[:16]
-
-        items.append({
-            "id": item_hash,
-            "trend_title": title,
-            "approx_traffic": approx_traffic,
-            "pub_date": pub_date,
-            "geo": geo,
-            "country": COUNTRIES[geo]["name"],
-            "language": COUNTRIES[geo]["lang"],
-            "news_items": news_items,
-        })
-
+    seen = set()
+    for q in queries:
+        url = f"https://news.google.com/rss/search?q={quote(q)}&hl={meta['hl']}&gl={meta['gl']}&ceid={meta['ceid']}"
+        for item in fetch_feed(url, f"GNews:{geo}:{q}"):
+            if item["url"] not in seen:
+                seen.add(item["url"])
+                item["geo"] = geo
+                item["country"] = meta["name"]
+                item["query"] = q
+                item["layer"] = "google_news"
+                items.append(item)
+        time.sleep(0.4)
     return items
 
 
-def translate_headline_heuristic(title: str, lang: str) -> str:
-    """
-    Lightweight headline translation placeholder.
-    In production, replace with Google Translate API, DeepL, or similar.
-    For English sources, returns as-is.
-    For non-English, marks as needing translation.
-    """
-    if lang == "en":
-        return title
-    # Placeholder: in production, call translation API here
-    return f"[TRANSLATE:{lang.upper()}] {title}"
+def collect_tech_feeds():
+    items = []
+    seen = set()
+    for name, url in TECH_FEEDS.items():
+        print(f"  📡 {name}...")
+        for item in fetch_feed(url, name):
+            if item["url"] in seen:
+                continue
+            if name in ("Ars Technica", "MIT Tech Review") and not is_ai_related(item["title"]):
+                continue
+            seen.add(item["url"])
+            item["geo"] = "GLOBAL"
+            item["country"] = "Global"
+            item["query"] = name
+            item["layer"] = "tech_feed"
+            items.append(item)
+        time.sleep(0.3)
+    return items
 
 
-def filter_and_enrich(items: list[dict]) -> list[dict]:
-    """Apply semantic AI filter, enrich with metadata, deduplicate."""
-    results = []
-    seen_urls = set()
+# ═════════════════════════════════════════════════════════════════════
+#  CLUSTERING & RANKING
+# ═════════════════════════════════════════════════════════════════════
+
+def normalize_for_clustering(title):
+    """Extract key terms for fuzzy topic clustering."""
+    t = re.sub(r"[^\w\s]", " ", title.lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    # Remove very common words
+    stops = {"the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to",
+             "for", "of", "and", "or", "its", "it", "by", "as", "with", "from",
+             "that", "this", "has", "have", "had", "be", "been", "will", "can",
+             "new", "says", "said", "how", "what", "why", "when", "who"}
+    words = [w for w in t.split() if w not in stops and len(w) > 2]
+    return set(words)
+
+
+def cluster_items(items):
+    """Group items by topic similarity. Returns list of clusters."""
+    clusters = []  # Each cluster: {"keywords": set, "items": [...]}
 
     for item in items:
-        news_titles = [n["title"] for n in item["news_items"]]
-        match_result = is_ai_related(item["trend_title"], news_titles)
-
-        if not match_result["match"]:
+        item_words = normalize_for_clustering(item["title"])
+        if not item_words:
             continue
 
-        # Extract and deduplicate relevant news pieces
-        filtered_news = []
-        for news in item["news_items"]:
-            if news["url"] in seen_urls:
-                continue
-            seen_urls.add(news["url"])
+        # Find best matching cluster
+        best_cluster = None
+        best_overlap = 0
+        for cluster in clusters:
+            overlap = len(item_words & cluster["keywords"])
+            # Require at least 2 shared significant words
+            if overlap >= 2 and overlap > best_overlap:
+                best_overlap = overlap
+                best_cluster = cluster
 
-            # Check individual news item relevance as well
-            news_match = is_ai_related(news["title"])
-            if news_match["match"] or match_result["confidence"] == "high":
-                translated = translate_headline_heuristic(
-                    news["title"], item["language"]
-                )
-                filtered_news.append({
-                    "headline_original": news["title"],
-                    "headline_en": translated,
-                    "source_url": news["url"],
-                    "source_name": news["source"],
-                    "news_relevance": news_match["confidence"] or "inherited",
-                })
+        if best_cluster:
+            best_cluster["items"].append(item)
+            best_cluster["keywords"] |= item_words
+        else:
+            clusters.append({"keywords": item_words, "items": [item]})
 
-        if not filtered_news:
-            continue
-
-        results.append({
-            "id": item["id"],
-            "trend_title": item["trend_title"],
-            "approx_traffic": item["approx_traffic"],
-            "pub_date": item["pub_date"],
-            "country": item["country"],
-            "geo": item["geo"],
-            "match_confidence": match_result["confidence"],
-            "matched_by": match_result["matched_by"],
-            "match_tier": match_result["tier"],
-            "news_items": filtered_news,
-            "retrieved_at": datetime.now(timezone.utc).isoformat(),
-        })
-
-    return results
+    # Sort clusters by size (most covered = most important)
+    clusters.sort(key=lambda c: len(c["items"]), reverse=True)
+    return clusters
 
 
-def load_processed_hashes(filepath: str) -> set:
-    """Load previously processed item hashes."""
-    if not os.path.exists(filepath):
-        return set()
-    with open(filepath, "r", encoding="utf-8") as f:
-        return set(line.strip() for line in f if line.strip())
+def pick_representative(cluster):
+    """Pick the best headline from a cluster."""
+    # Prefer English items, then by source quality
+    preferred_sources = ["TechCrunch", "The Verge", "Wired", "Ars Technica",
+                         "MIT Tech Review", "VentureBeat", "Reuters", "Bloomberg",
+                         "BBC", "NYT", "WSJ", "Financial Times"]
+
+    items = cluster["items"]
+
+    # Score each item
+    def score(item):
+        s = 0
+        # English preference
+        geo = item.get("geo", "")
+        if geo in ("US", "GB", "CA", "GLOBAL"):
+            s += 10
+        # Known source bonus
+        src = item.get("source", "").lower()
+        for i, ps in enumerate(preferred_sources):
+            if ps.lower() in src:
+                s += (len(preferred_sources) - i)
+                break
+        # Longer titles tend to be more descriptive
+        s += min(len(item["title"]) / 20, 5)
+        return s
+
+    items.sort(key=score, reverse=True)
+    return items[0]
 
 
-def save_processed_hashes(filepath: str, hashes: set):
-    """Save processed hashes (keep last 5000 to prevent unbounded growth)."""
-    sorted_hashes = sorted(hashes)
-    if len(sorted_hashes) > 5000:
-        sorted_hashes = sorted_hashes[-5000:]
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write("\n".join(sorted_hashes) + "\n")
+# ═════════════════════════════════════════════════════════════════════
+#  NEWSLETTER GENERATION
+# ═════════════════════════════════════════════════════════════════════
+
+def count_words(text):
+    return len(text.split())
 
 
-def output_json(results: list[dict], filepath: str):
-    """Write structured JSON output."""
-    output = {
-        "meta": {
-            "system": "AI Trend Monitor v1.0",
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "countries_monitored": list(COUNTRIES.keys()),
-            "total_trends_matched": len(results),
-            "total_news_items": sum(len(r["news_items"]) for r in results),
-        },
-        "results": results,
-    }
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+def generate_newsletter(clusters, all_items):
+    """Generate a ~4000 word Markdown newsletter."""
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
+    # Count items per country for stats
+    country_counts = Counter(i["country"] for i in all_items)
+    total_sources = len(set(i.get("source", "") for i in all_items if i.get("source")))
 
-def output_markdown(results: list[dict], filepath: str):
-    """Write human-readable Markdown output."""
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    # ── Header ──
     lines = [
-        "# 🌐 AI & N8N Global Trend Monitor\n",
-        f"**Last updated:** {now_utc}\n",
-        f"**Countries:** {', '.join(c['name'] for c in COUNTRIES.values())}\n",
-        f"**Trends matched:** {len(results)} | "
-        f"**News items:** {sum(len(r['news_items']) for r in results)}\n",
-        "---\n",
+        f"# 🌐 AI & Automation Daily Brief",
+        f"### {today}",
+        "",
+        f"*Monitoring {len(COUNTRIES)} countries · {len(all_items)} articles scanned · {total_sources} sources · {len(clusters)} topics identified*",
+        "",
+        "---",
+        "",
     ]
 
-    # Group by country
-    by_country = {}
-    for r in results:
-        by_country.setdefault(r["country"], []).append(r)
+    word_count = count_words("\n".join(lines))
+    budget = MAX_NEWSLETTER_WORDS - 200  # Reserve for footer
 
-    for country_name in sorted(by_country.keys()):
-        country_results = by_country[country_name]
-        geo = country_results[0]["geo"]
-        lines.append(f"\n## 🏳️ {country_name} ({geo})\n")
+    # ── Top Stories (big clusters) ──
+    top_clusters = [c for c in clusters if len(c["items"]) >= 3]
+    mid_clusters = [c for c in clusters if len(c["items"]) == 2]
+    small_clusters = [c for c in clusters if len(c["items"]) == 1]
 
-        for item in country_results:
-            conf_badge = {"high": "🟢", "medium": "🟡", "low": "🟠"}.get(
-                item["match_confidence"], "⚪"
-            )
-            lines.append(
-                f"### {conf_badge} {item['trend_title']} "
-                f"({item['approx_traffic']}, {item['pub_date'][:16]})\n"
-            )
-            lines.append(
-                f"> Confidence: **{item['match_confidence']}** | "
-                f"Tier: {item['match_tier']} | "
-                f"Matched by: `{item['matched_by']}`\n"
-            )
-            for news in item["news_items"]:
-                lines.append(
-                    f"- **{news['headline_en']}**  \n"
-                    f"  [Source]({news['source_url']})"
-                    f"{' | ' + news['source_name'] if news['source_name'] else ''}\n"
-                )
-            lines.append("")
+    if top_clusters:
+        lines.append("## 🔥 Top Stories\n")
+        word_count += 3
 
-    if not results:
-        lines.append(
-            "\n> ℹ️ No AI/N8N-related trends detected in this cycle.\n"
-        )
+        for cluster in top_clusters[:10]:
+            if word_count >= budget:
+                break
 
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+            rep = pick_representative(cluster)
+            countries = sorted(set(i.get("country", "?") for i in cluster["items"]))
+            sources_list = sorted(set(i.get("source", "?") for i in cluster["items"] if i.get("source")))[:5]
+            coverage = len(cluster["items"])
+
+            section = []
+            section.append(f"### {rep['title']}")
+            section.append("")
+            section.append(f"📊 **{coverage} sources** across {', '.join(countries)}")
+            section.append("")
+
+            # List top 5 unique articles in this cluster
+            seen_titles = set()
+            article_count = 0
+            for item in cluster["items"]:
+                short = item["title"][:80]
+                if short in seen_titles or article_count >= 5:
+                    continue
+                seen_titles.add(short)
+                src_tag = f" *({item['source']})*" if item.get("source") else ""
+                geo_tag = f" `{item.get('geo', '')}`" if item.get("geo") not in ("GLOBAL", "") else ""
+                section.append(f"- [{item['title']}]({item['url']}){src_tag}{geo_tag}")
+                article_count += 1
+
+            section.append("")
+            block = "\n".join(section)
+            block_words = count_words(block)
+
+            if word_count + block_words < budget:
+                lines.extend(section)
+                word_count += block_words
+
+    # ── Notable Coverage (2 sources) ──
+    if mid_clusters and word_count < budget - 300:
+        lines.append("## 📰 Notable Coverage\n")
+        word_count += 3
+
+        for cluster in mid_clusters[:15]:
+            if word_count >= budget - 100:
+                break
+
+            rep = pick_representative(cluster)
+            other = [i for i in cluster["items"] if i["url"] != rep["url"]]
+            other_src = other[0].get("source", "") if other else ""
+            geo_tag = f" `{rep.get('geo', '')}`" if rep.get("geo") not in ("GLOBAL", "") else ""
+
+            line = f"- **[{rep['title']}]({rep['url']})**{geo_tag}"
+            if other_src:
+                line += f"  \n  Also covered by: *{other_src}*"
+            lines.append(line)
+            word_count += count_words(line)
+
+        lines.append("")
+
+    # ── Quick Hits (single source, fill remaining budget) ──
+    if small_clusters and word_count < budget - 200:
+        lines.append("## ⚡ Quick Hits\n")
+        word_count += 3
+
+        for cluster in small_clusters[:25]:
+            if word_count >= budget - 50:
+                break
+
+            item = cluster["items"][0]
+            geo = item.get("geo", "")
+            geo_tag = f" `{geo}`" if geo not in ("GLOBAL", "") else ""
+            src_tag = f" — *{item['source']}*" if item.get("source") else ""
+
+            line = f"- [{item['title']}]({item['url']}){src_tag}{geo_tag}"
+            lines.append(line)
+            word_count += count_words(line)
+
+        lines.append("")
+
+    # ── Regional Breakdown ──
+    if word_count < budget - 100:
+        lines.append("## 🗺️ Regional Breakdown\n")
+        lines.append("| Region | Articles |")
+        lines.append("|--------|----------|")
+        for country, count in country_counts.most_common():
+            lines.append(f"| {country} | {count} |")
+        lines.append("")
+        word_count += 5 + len(country_counts)
+
+    # ── Footer ──
+    lines.extend([
+        "---",
+        "",
+        f"*Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} · "
+        f"AI & N8N Global News Monitor v2.0 · "
+        f"[View raw data](ai_trends.json)*",
+    ])
+
+    return "\n".join(lines)
 
 
-def clean_old_entries(filepath: str, max_entries: int = 200):
-    """Trim old Markdown entries to prevent unbounded file growth."""
-    if not os.path.exists(filepath):
-        return
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
-    sections = content.split("### ")
-    if len(sections) > max_entries:
-        sections = sections[:max_entries]
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write("### ".join(sections))
+# ═════════════════════════════════════════════════════════════════════
+#  DEDUP & PERSISTENCE
+# ═════════════════════════════════════════════════════════════════════
+
+def make_hash(item):
+    return hashlib.sha256((item.get("url", "") + item.get("title", "")).encode()).hexdigest()[:16]
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  MAIN PIPELINE
-# ─────────────────────────────────────────────────────────────────────
+def load_hashes(path):
+    if not os.path.exists(path):
+        return set()
+    with open(path, "r") as f:
+        return set(l.strip() for l in f if l.strip())
+
+
+def save_hashes(path, hashes):
+    h = sorted(hashes)[-10000:]
+    with open(path, "w") as f:
+        f.write("\n".join(h) + "\n")
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═════════════════════════════════════════════════════════════════════
 
 def main():
     print("=" * 60)
-    print("AI & N8N Global Trend Monitor — Starting scan")
-    print(f"Timestamp: {datetime.now(timezone.utc).isoformat()}")
-    print(f"Countries: {len(COUNTRIES)}")
+    print("  AI & N8N Daily Newsletter Generator")
+    print(f"  {datetime.now(timezone.utc).isoformat()}")
     print("=" * 60)
 
-    processed_file = "processed_hashes.txt"
-    json_output = "ai_trends.json"
-    md_output = "ai_trends.md"
-    readme_output = "README.md"
-
-    processed_hashes = load_processed_hashes(processed_file)
+    hash_file = "processed_hashes.txt"
+    old_hashes = load_hashes(hash_file)
     all_items = []
 
+    # ── Layer 1: Google News ──
+    print("\n📰 Layer 1: Google News")
     for geo, meta in COUNTRIES.items():
-        print(f"\n🔍 Scanning {meta['name']} ({geo})...")
-        xml_content = fetch_rss(geo)
-        if xml_content is None:
-            continue
+        print(f"  🔍 {meta['name']}...", end=" ")
+        items = collect_google_news(geo, meta)
+        print(f"{len(items)} items")
+        all_items.extend(items)
 
-        items = parse_rss(xml_content, geo)
-        print(f"   Found {len(items)} trending topics")
+    # ── Layer 2: Tech Feeds ──
+    print("\n🔬 Layer 2: Tech Feeds")
+    tech = collect_tech_feeds()
+    all_items.extend(tech)
+    print(f"  Total: {len(tech)}")
 
-        # Filter out already-processed items
-        new_items = [i for i in items if i["id"] not in processed_hashes]
-        print(f"   New (unprocessed): {len(new_items)}")
-        all_items.extend(new_items)
-
-    print(f"\n📊 Total new items across all countries: {len(all_items)}")
-
-    # Apply AI semantic filter
-    filtered = filter_and_enrich(all_items)
-    print(f"✅ AI/N8N-related trends matched: {len(filtered)}")
-    print(f"   Total relevant news items: {sum(len(r['news_items']) for r in filtered)}")
-
-    # Mark all scanned items as processed (not just matched ones)
+    # ── Dedup ──
+    seen_urls = set()
+    unique = []
     for item in all_items:
-        processed_hashes.add(item["id"])
+        h = make_hash(item)
+        if h in old_hashes or item["url"] in seen_urls:
+            continue
+        seen_urls.add(item["url"])
+        item["hash"] = h
+        unique.append(item)
 
-    # Output
-    output_json(filtered, json_output)
-    output_markdown(filtered, md_output)
+    print(f"\n🧹 {len(all_items)} raw → {len(unique)} new unique")
 
-    # Copy to README
-    if os.path.exists(md_output):
-        with open(md_output, "r", encoding="utf-8") as src:
-            content = src.read()
-        with open(readme_output, "w", encoding="utf-8") as dst:
-            dst.write(content)
+    # ── Cluster & Rank ──
+    clusters = cluster_items(unique)
+    top = sum(1 for c in clusters if len(c["items"]) >= 3)
+    mid = sum(1 for c in clusters if len(c["items"]) == 2)
+    solo = sum(1 for c in clusters if len(c["items"]) == 1)
+    print(f"📊 {len(clusters)} topics: {top} hot, {mid} notable, {solo} single")
 
-    save_processed_hashes(processed_file, processed_hashes)
-    clean_old_entries(md_output)
+    # ── Generate Newsletter ──
+    newsletter = generate_newsletter(clusters, unique)
+    wc = count_words(newsletter)
+    print(f"📝 Newsletter: {wc} words")
 
-    print(f"\n📁 Outputs written:")
-    print(f"   JSON: {json_output}")
-    print(f"   Markdown: {md_output}")
-    print(f"   README: {readme_output}")
+    # ── Save outputs ──
+    with open("ai_trends.md", "w", encoding="utf-8") as f:
+        f.write(newsletter)
+
+    with open("README.md", "w", encoding="utf-8") as f:
+        f.write(newsletter)
+
+    # JSON output (full data for downstream)
+    json_out = {
+        "meta": {
+            "system": "AI & N8N Newsletter v2.0",
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "total_items": len(unique),
+            "total_clusters": len(clusters),
+            "newsletter_words": wc,
+            "countries": {c["name"]: sum(1 for i in unique if i.get("country") == c["name"]) for c in COUNTRIES.values()},
+        },
+        "items": [
+            {
+                "id": i["hash"],
+                "headline": i["title"],
+                "url": i["url"],
+                "source": i.get("source", ""),
+                "published": i.get("published", ""),
+                "country": i.get("country", ""),
+                "geo": i.get("geo", ""),
+                "query": i.get("query", ""),
+                "layer": i.get("layer", ""),
+            }
+            for i in unique
+        ],
+    }
+    with open("ai_trends.json", "w", encoding="utf-8") as f:
+        json.dump(json_out, f, indent=2, ensure_ascii=False)
+
+    # Update hashes
+    for i in unique:
+        old_hashes.add(i["hash"])
+    save_hashes(hash_file, old_hashes)
+
+    print(f"\n✅ Done! Files: ai_trends.md, ai_trends.json, README.md")
     print("=" * 60)
 
 
