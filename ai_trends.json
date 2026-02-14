@@ -1,0 +1,20 @@
+{
+  "meta": {
+    "system": "AI Trend Monitor v1.0",
+    "generated_at": "2026-02-14T02:44:17.933840+00:00",
+    "countries_monitored": [
+      "US",
+      "GB",
+      "PT",
+      "DE",
+      "CN",
+      "JP",
+      "IL",
+      "AE",
+      "CA"
+    ],
+    "total_trends_matched": 0,
+    "total_news_items": 0
+  },
+  "results": []
+}
