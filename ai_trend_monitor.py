@@ -9,7 +9,7 @@ Single script that:
 
 Run daily via GitHub Actions. No API keys needed.
 
-Dependencies: pip install requests feedparser
+Dependencies: pip install requests feedparser deep-translator
 """
 
 import feedparser
@@ -115,6 +115,65 @@ def is_ai_related(text):
         if p.search(t):
             return True
     return False
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  TRANSLATION
+# ═════════════════════════════════════════════════════════════════════
+
+def is_english(text):
+    """Quick heuristic: if >70% of chars are ASCII letters, likely English."""
+    if not text:
+        return True
+    ascii_letters = sum(1 for c in text if c.isascii() and c.isalpha())
+    total_letters = sum(1 for c in text if c.isalpha())
+    if total_letters == 0:
+        return True
+    return (ascii_letters / total_letters) > 0.7
+
+
+def translate_to_english(text):
+    """Translate text to English. Returns original if already English or on failure."""
+    if not text or is_english(text):
+        return text
+    try:
+        from deep_translator import GoogleTranslator
+        result = GoogleTranslator(source="auto", target="en").translate(text)
+        return result if result else text
+    except Exception:
+        return text
+
+
+def translate_batch(texts):
+    """Translate a list of texts, preserving order. Skips already-English ones."""
+    results = []
+    to_translate = []  # (index, text) pairs that need translation
+    
+    for i, text in enumerate(texts):
+        if not text or is_english(text):
+            results.append(text)
+        else:
+            results.append(None)  # placeholder
+            to_translate.append((i, text))
+    
+    # Batch translate non-English texts
+    if to_translate:
+        try:
+            from deep_translator import GoogleTranslator
+            translator = GoogleTranslator(source="auto", target="en")
+            for idx, text in to_translate:
+                try:
+                    translated = translator.translate(text)
+                    results[idx] = translated if translated else text
+                except Exception:
+                    results[idx] = text
+                time.sleep(0.1)  # Rate limit politeness
+        except ImportError:
+            # Fallback: return originals
+            for idx, text in to_translate:
+                results[idx] = text
+    
+    return results
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -269,8 +328,21 @@ def count_words(text):
 
 
 def generate_newsletter(clusters, all_items):
-    """Generate a ~4000 word Markdown newsletter."""
+    """Generate a ~4000 word English Markdown newsletter."""
     today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    # ── Pre-translate all headlines that will appear in the newsletter ──
+    # Collect all titles we'll display
+    display_items = []
+    for cluster in clusters:
+        for item in cluster["items"]:
+            display_items.append(item)
+
+    titles = [item["title"] for item in display_items]
+    translated = translate_batch(titles)
+    # Write back translated titles into a separate field
+    for item, t in zip(display_items, translated):
+        item["title_en"] = t or item["title"]
 
     # Count items per country for stats
     country_counts = Counter(i["country"] for i in all_items)
@@ -304,12 +376,13 @@ def generate_newsletter(clusters, all_items):
                 break
 
             rep = pick_representative(cluster)
+            rep_title = rep.get("title_en", rep["title"])
             countries = sorted(set(i.get("country", "?") for i in cluster["items"]))
             sources_list = sorted(set(i.get("source", "?") for i in cluster["items"] if i.get("source")))[:5]
             coverage = len(cluster["items"])
 
             section = []
-            section.append(f"### {rep['title']}")
+            section.append(f"### {rep_title}")
             section.append("")
             section.append(f"📊 **{coverage} sources** across {', '.join(countries)}")
             section.append("")
@@ -318,13 +391,14 @@ def generate_newsletter(clusters, all_items):
             seen_titles = set()
             article_count = 0
             for item in cluster["items"]:
-                short = item["title"][:80]
+                t_en = item.get("title_en", item["title"])
+                short = t_en[:80]
                 if short in seen_titles or article_count >= 5:
                     continue
                 seen_titles.add(short)
                 src_tag = f" *({item['source']})*" if item.get("source") else ""
                 geo_tag = f" `{item.get('geo', '')}`" if item.get("geo") not in ("GLOBAL", "") else ""
-                section.append(f"- [{item['title']}]({item['url']}){src_tag}{geo_tag}")
+                section.append(f"- [{t_en}]({item['url']}){src_tag}{geo_tag}")
                 article_count += 1
 
             section.append("")
@@ -345,11 +419,12 @@ def generate_newsletter(clusters, all_items):
                 break
 
             rep = pick_representative(cluster)
+            rep_title = rep.get("title_en", rep["title"])
             other = [i for i in cluster["items"] if i["url"] != rep["url"]]
             other_src = other[0].get("source", "") if other else ""
             geo_tag = f" `{rep.get('geo', '')}`" if rep.get("geo") not in ("GLOBAL", "") else ""
 
-            line = f"- **[{rep['title']}]({rep['url']})**{geo_tag}"
+            line = f"- **[{rep_title}]({rep['url']})**{geo_tag}"
             if other_src:
                 line += f"  \n  Also covered by: *{other_src}*"
             lines.append(line)
@@ -371,7 +446,7 @@ def generate_newsletter(clusters, all_items):
             geo_tag = f" `{geo}`" if geo not in ("GLOBAL", "") else ""
             src_tag = f" — *{item['source']}*" if item.get("source") else ""
 
-            line = f"- [{item['title']}]({item['url']}){src_tag}{geo_tag}"
+            line = f"- [{item.get('title_en', item['title'])}]({item['url']}){src_tag}{geo_tag}"
             lines.append(line)
             word_count += count_words(line)
 
