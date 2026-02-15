@@ -19,7 +19,7 @@ jobs:
       with:
         python-version: '3.12'
 
-    - run: pip install requests feedparser
+    - run: pip install requests feedparser deep-translator
 
     - run: python ai_trend_monitor.py
 
